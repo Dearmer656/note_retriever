@@ -1,127 +1,76 @@
 #!/usr/bin/env python3
-import csv
-import json
+import csv, json, time, requests
 from collections import defaultdict
-import openreview
 
-BASE = "https://api2.openreview.net"
-VENUE = "TMLR"
+BASE="https://api2.openreview.net"
+S=requests.Session()
+S.headers.update({
+ "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153.0 Safari/537.36",
+ "Accept":"application/json,text/plain,*/*",
+ "Referer":"https://openreview.net/"
+})
 
-def value(x):
-    if isinstance(x, dict) and "value" in x:
-        return x["value"]
-    return x
+def val(x):
+    return x.get("value") if isinstance(x,dict) and "value" in x else x
 
-def get_all_submissions():
-    client = openreview.api.OpenReviewClient(baseurl=BASE)
-    notes = client.get_all_notes(invitation=f"{VENUE}/-/Submission", details="replies")
-    print(f"fetched {len(notes)} submissions", flush=True)
-    return client, notes
+def fetch_all():
+    out=[]; offset=0; limit=25
+    while True:
+        r=S.get(BASE+"/notes",params={
+            "invitation":"TMLR/-/Submission",
+            "details":"replies",
+            "limit":limit,
+            "offset":offset,
+            "sort":"id"
+        },timeout=60)
+        print("GET",offset,r.status_code,flush=True)
+        if r.status_code!=200:
+            print(r.text[:2000],flush=True); r.raise_for_status()
+        batch=r.json().get("notes",[])
+        out.extend(batch)
+        if len(batch)<limit: break
+        offset += len(batch)
+        time.sleep(0.5)
+    return out
 
-def decision_of(note):
-    replies = (note.details or {}).get("replies", [])
-    decisions = []
-    for reply in replies:
-        invitations = reply.get("invitations", [])
-        if any(str(inv).endswith("/Decision") for inv in invitations):
-            rec = value(reply.get("content", {}).get("recommendation"))
-            if rec:
-                decisions.append((reply.get("cdate", 0) or 0, str(rec)))
-    if not decisions:
-        return None
-    decisions.sort()
-    return decisions[-1][1]
+def decision(note):
+    ds=[]
+    for rep in note.get("details",{}).get("replies",[]):
+        invs=rep.get("invitations",[])
+        if any(str(i).endswith("/Decision") for i in invs):
+            rec=val(rep.get("content",{}).get("recommendation"))
+            if rec: ds.append((rep.get("cdate") or 0,str(rec)))
+    return sorted(ds)[-1][1] if ds else None
 
-def classify(decision):
-    if not decision:
-        return None
-    d = decision.strip().lower()
-    if d.startswith("accept"):
-        return "accept"
-    if d.startswith("reject"):
-        return "reject"
+def classify(d):
+    if not d:return None
+    x=d.lower().strip()
+    if x.startswith("accept"):return "accept"
+    if x.startswith("reject"):return "reject"
     return None
 
-def ae_of(note):
-    ae = value((note.content or {}).get("assigned_action_editor"))
-    if not ae:
-        return None
-    return str(ae).split(",")[0].strip()
-
-def profile_name(client, ae_id, cache):
-    if ae_id in cache:
-        return cache[ae_id]
-    name = ae_id
-    try:
-        p = client.get_profile(ae_id)
-        content = p.content or {}
-        names = content.get("names", [])
-        preferred = next((n for n in names if n.get("preferred")), None)
-        preferred = preferred or (names[0] if names else None)
-        if preferred:
-            name = preferred.get("fullname") or preferred.get("username") or ae_id
-    except Exception as e:
-        print(f"profile lookup failed for {ae_id}: {e}", flush=True)
-    cache[ae_id] = name
-    return name
-
 def main():
-    client, notes = get_all_submissions()
-    stats = defaultdict(lambda: {"accept": 0, "reject": 0, "other_decision": 0})
-    missing_ae = 0
-    no_decision = 0
-    decision_labels = defaultdict(int)
-
-    for note in notes:
-        decision = decision_of(note)
-        if not decision:
-            no_decision += 1
-            continue
-        decision_labels[decision] += 1
-        cls = classify(decision)
-        ae = ae_of(note)
+    notes=fetch_all()
+    stats=defaultdict(lambda:{"accepted":0,"rejected":0})
+    missing=0
+    for n in notes:
+        d=decision(n); c=classify(d)
+        if not c: continue
+        ae=val(n.get("content",{}).get("assigned_action_editor"))
         if not ae:
-            missing_ae += 1
-            continue
-        if cls in ("accept", "reject"):
-            stats[ae][cls] += 1
-        else:
-            stats[ae]["other_decision"] += 1
-
-    cache = {}
-    rows = []
-    for ae, s in stats.items():
-        n = s["accept"] + s["reject"]
-        rows.append({
-            "ae_id": ae,
-            "ae_name": profile_name(client, ae, cache),
-            "accepted": s["accept"],
-            "rejected": s["reject"],
-            "decided_n": n,
-            "accept_rate": (s["accept"] / n) if n else None,
-            "other_decision": s["other_decision"],
-        })
-
-    rows.sort(key=lambda x: (-x["decided_n"], x["ae_name"]))
-    fields = ["ae_id","ae_name","accepted","rejected","decided_n","accept_rate","other_decision"]
-    with open("tmlr_ae_stats.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
-
-    summary = {
-        "submissions_fetched": len(notes),
-        "ae_rows": len(rows),
-        "no_decision": no_decision,
-        "decisions_missing_ae": missing_ae,
-        "decision_labels": dict(sorted(decision_labels.items())),
-    }
-    with open("summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    print(json.dumps(summary, indent=2), flush=True)
-    print("\nTop AE rows:")
-    for row in rows[:30]:
-        print(row)
-
-if __name__ == "__main__":
-    main()
+            missing+=1; continue
+        ae=str(ae).split(",")[0].strip()
+        stats[ae]["accepted" if c=="accept" else "rejected"]+=1
+    rows=[]
+    for ae,s in stats.items():
+        N=s["accepted"]+s["rejected"]
+        rows.append({"ae_id":ae,**s,"decided_n":N,"accept_rate":s["accepted"]/N if N else None})
+    rows.sort(key=lambda r:(-r["decided_n"],r["ae_id"]))
+    with open("tmlr_ae_stats.csv","w",newline="",encoding="utf8") as f:
+        w=csv.DictWriter(f,fieldnames=["ae_id","accepted","rejected","decided_n","accept_rate"])
+        w.writeheader();w.writerows(rows)
+    summary={"submissions":len(notes),"aes":len(rows),"decided_missing_ae":missing}
+    with open("summary.json","w") as f:json.dump(summary,f,indent=2)
+    print(json.dumps(summary),flush=True)
+    print(open("tmlr_ae_stats.csv").read(),flush=True)
+if __name__=="__main__":main()
